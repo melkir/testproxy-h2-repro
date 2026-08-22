@@ -27,9 +27,9 @@ symptoms of the same mismatch below, not two different bugs.)
 **With `testProxy` removed from `next.config.ts`** (same build, same
 request): the request succeeds normally (`"status":200`).
 
-**A plain HTTP (no TLS) request succeeds even with `testProxy: true`** —
-change the URL in `app/page.tsx` to `http://neverssl.com/` to see this.
-Only TLS connections that negotiate `h2` are affected.
+**A plain HTTP (no TLS) request succeeds even with `testProxy: true`.**
+Only TLS connections that negotiate `h2` are affected — change the URL in
+`app/page.tsx` to `http://neverssl.com/` to see this.
 
 ## Root cause
 
