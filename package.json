@@ -3,14 +3,18 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "playwright test"
   },
   "dependencies": {
+    "@sanity/client": "^7.26.2",
     "next": "canary",
+    "next-sanity": "^13.3.3",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/node": "^22",
     "@types/react": "^19",
     "typescript": "^5"
