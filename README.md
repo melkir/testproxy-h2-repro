@@ -1,16 +1,11 @@
-# testProxy breaks get-it passthrough requests
+# testProxy breaks passthrough requests to HTTP/2 hosts
 
 Minimal reproduction for https://github.com/vercel/next.js/issues/96521.
 
-`experimental.testProxy: true` in `next.config.ts` breaks outbound requests
-made with [`get-it`](https://github.com/sanity-io/get-it), a general-purpose
-HTTP client (`next-sanity`, among other libraries, is affected as a
-consumer of it).
-
-`app/page.tsx` builds a `get-it` requester with `retry`, `jsonRequest`,
-`jsonResponse`, `httpErrors`, and `promise` middleware and makes one GET
-request to `https://api.github.com/zen` (a plain public HTTP/2 endpoint, no
-credentials needed).
+`experimental.testProxy: true` in `next.config.ts` breaks any outbound
+`fetch()` call to a server that negotiates HTTP/2 via ALPN — which is
+virtually every modern HTTPS server. No third-party library involved:
+`app/page.tsx` is a single plain `fetch()` call.
 
 ## Reproduce
 
@@ -19,69 +14,54 @@ npm install
 npm test
 ```
 
-**With `testProxy: true`:** the request fails after retrying:
+**With `testProxy: true`:** the request fails:
 
 ```json
-{ "error": "TypeError: fetch failed", "cause": "SocketError: other side closed", "attemptNumber": 5 }
+{ "error": "TypeError: fetch failed", "cause": "SocketError: other side closed" }
 ```
 
-(The exact `cause` varies between runs — sometimes
-`HTTPParserError: Response does not match the HTTP/1.1 protocol`, with a raw
-HTTP/2 SETTINGS frame in the response bytes. Both look like symptoms of the
-same underlying passthrough failure, not two different bugs.)
+(Sometimes instead: `HTTPParserError: Response does not match the HTTP/1.1
+protocol`, with a raw HTTP/2 SETTINGS frame in the response bytes. Both are
+symptoms of the same mismatch below, not two different bugs.)
 
 **With `testProxy` removed from `next.config.ts`** (same build, same
-request): the request succeeds normally (`"statusCode":200`).
+request): the request succeeds normally (`"status":200`).
 
-## Bisection notes
+**A plain HTTP (no TLS) request succeeds even with `testProxy: true`** —
+change the URL in `app/page.tsx` to `http://neverssl.com/` to see this.
+Only TLS connections that negotiate `h2` are affected.
 
-- **No active test harness required.** This reproduces via plain `curl`
-  against `next start` — no Playwright, no
-  `next/experimental/testmode/playwright` fixture attached. Just having
-  `experimental.testProxy: true` set in config is enough.
-- **A single request is enough** — no concurrency, no retries needed to
-  trigger the underlying failure (retries just determine how the failure
-  eventually surfaces: `SocketError`/`HTTPParserError` after `attemptNumber:
-  5`, vs. hanging indefinitely with zero retries).
-- **Not reproducible with a plain `fetch()` call.** The same host, called
-  directly with `fetch()` instead of through `get-it`, succeeds under the
-  same `testProxy: true` setup.
-- **`fetch === globalThis.fetch`** is `true` at both the failing (`get-it`)
-  and passing (plain `fetch()`) call sites — same function object, confirmed
-  by logging the reference and its source at both locations.
-- **`typeof XMLHttpRequest`** is `undefined`, so `get-it` resolves to the
-  same fetch-based adapter as a plain `fetch()` call, not a different
-  transport.
-- **Transport library version doesn't matter.** Reproduces identically on
-  `get-it@8.8.3` and `get-it@9.5.1`.
-- A naive `getIt([])` call with no middleware does not reproduce it — that
-  hangs regardless of `testProxy`, which is an unrelated `get-it` usage
-  issue, not this bug. The middleware stack above is required to complete a
-  request at all.
+## Root cause
 
-Current state: the trigger is `get-it`'s specific request/response handling
-architecture — an XHR-emulation class wrapping `fetch()`, driven through an
-event-emitter/pub-sub middleware pipeline (`channels.request.subscribe()`,
-`readyState` callbacks) rather than a linear `await fetch()` call. The
-mechanism producing the difference between that and a plain `fetch()` call
-is not identified.
+Traced by reading `@mswjs/interceptors`' compiled `ClientRequest` module
+(`node/dist/compiled/@mswjs/interceptors/ClientRequest/index.js`, vendored
+by Next for `testProxy`):
 
-### Interception architecture (from reading `next/dist/experimental/testmode/{fetch,httpget,context}.js`)
+- A global `socket-interceptor` patches `net.Socket.prototype.connect` for
+  every outbound socket in the process — not just `http.ClientRequest`
+  traffic, so `fetch()`/undici is included regardless of which library
+  calls it.
+- For a request with no active test context, it reconstructs the
+  connection as a "passthrough": it opens its own real socket
+  (`createConnection()`) using TLS options copied from the original
+  connection attempt (including its ALPN protocol list), then replays the
+  request onto it and reads the response back.
+- That passthrough machinery is built assuming HTTP/1.1 framing
+  end-to-end. When the passthrough socket's TLS handshake negotiates `h2`
+  (because the ALPN list it copied includes it, and the remote server
+  supports it), the interceptor still writes the request as plain HTTP/1.1
+  text and tries to parse the response with its own vendored HTTP/1.1
+  parser (`llhttp`, bundled as WASM). The remote server, on receiving
+  non-HTTP/2-framed bytes over an HTTP/2 connection, closes it
+  (`SocketError: other side closed`) — or in other timings, the client
+  receives real HTTP/2 frames back and its HTTP/1.1 parser can't read them
+  (`HTTPParserError`).
 
-- `interceptFetch` monkeypatches `global.fetch`. Its passthrough branch
-  (`handleFetch` → no `testInfo`) sets a `next-test-internal: '1'` header on
-  the outgoing `Request` and calls the pre-patch `originalFetch(request)`.
-- `interceptHttpGet` separately installs `@mswjs/interceptors`'
-  `ClientRequestInterceptor`, which is meant to see that header and skip
-  re-handling, so the passthrough request reaches the real network exactly
-  once.
-- `ClientRequestInterceptor` is documented as intercepting Node's legacy
-  `http.ClientRequest`. Modern Node's `fetch()` (undici-backed) doesn't go
-  through `http.ClientRequest`. Whether/how the marker-checking actually
-  applies to undici's internal connections is inside the vendored
-  `@mswjs/interceptors` package and hasn't been traced further.
-- `@mswjs/interceptors`' compiled `ClientRequest` module bundles its own
-  `llhttp` (HTTP/1.1 parser, WASM) and has ALPN-aware mock-socket code
-  (`getALPNNegotiatedProtocol`), suggesting it's aware of HTTP/2 negotiation
-  at the socket level, which is consistent with the `HTTPParserError`
-  variant of the failure.
+Confirmed directly by instrumenting the compiled interceptor to log the
+negotiated ALPN protocol and the raw bytes being written to the socket:
+negotiated protocol was `h2`, bytes written were `GET /zen HTTP/1.1\r\n...`.
+
+This is not specific to any particular HTTP client or library — a bare
+`fetch()` call reproduces it exactly like every other case tested
+(`get-it`, `@sanity/client`, `next-sanity`). Whatever library is used, the
+determining factor is simply whether the target host negotiates `h2`.
