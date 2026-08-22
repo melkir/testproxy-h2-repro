@@ -3,15 +3,14 @@
 Minimal reproduction for https://github.com/vercel/next.js/issues/96521.
 
 `experimental.testProxy: true` in `next.config.ts` breaks outbound requests
-made with [`get-it`](https://github.com/sanity-io/get-it) (the HTTP client
-`@sanity/client` and other libraries use), independent of Sanity — this repro
-has no Sanity dependency at all.
+made with [`get-it`](https://github.com/sanity-io/get-it), a general-purpose
+HTTP client (`next-sanity`, among other libraries, is affected as a
+consumer of it).
 
-`app/page.tsx` builds a `get-it` requester with the exact middleware stack
-`@sanity/client` configures internally (`retry`, `jsonRequest`,
-`jsonResponse`, `httpErrors`, `promise`) and makes one GET request to
-`https://api.github.com/zen` (a plain public HTTP/2 endpoint, no credentials
-needed).
+`app/page.tsx` builds a `get-it` requester with `retry`, `jsonRequest`,
+`jsonResponse`, `httpErrors`, and `promise` middleware and makes one GET
+request to `https://api.github.com/zen` (a plain public HTTP/2 endpoint, no
+credentials needed).
 
 ## Reproduce
 
@@ -40,15 +39,6 @@ request): the request succeeds normally (`"statusCode":200`).
   against `next start` — no Playwright, no
   `next/experimental/testmode/playwright` fixture attached. Just having
   `experimental.testProxy: true` set in config is enough.
-- **Not Sanity-specific.** This version has zero `@sanity/client` or
-  `next-sanity` code — just `get-it` with the same middleware stack
-  `@sanity/client` uses internally, hitting a plain HTTP/2 host. An earlier
-  version of this repro used `next-sanity`'s `sanityFetch` (via `defineLive`)
-  and assumed the trigger was Sanity-specific; it isn't. (A naive
-  `getIt([])` call with no middleware doesn't reproduce it — that hangs
-  regardless of `testProxy`, which is an unrelated `get-it` usage issue, not
-  this bug. The middleware stack above is required to complete a request at
-  all.)
 - **A single request is enough** — no concurrency, no retries needed to
   trigger the underlying failure (retries just determine how the failure
   eventually surfaces: `SocketError`/`HTTPParserError` after `attemptNumber:
@@ -64,6 +54,10 @@ request): the request succeeds normally (`"statusCode":200`).
   transport.
 - **Transport library version doesn't matter.** Reproduces identically on
   `get-it@8.8.3` and `get-it@9.5.1`.
+- A naive `getIt([])` call with no middleware does not reproduce it — that
+  hangs regardless of `testProxy`, which is an unrelated `get-it` usage
+  issue, not this bug. The middleware stack above is required to complete a
+  request at all.
 
 Current state: the trigger is `get-it`'s specific request/response handling
 architecture — an XHR-emulation class wrapping `fetch()`, driven through an
